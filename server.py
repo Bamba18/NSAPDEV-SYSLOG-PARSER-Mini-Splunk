@@ -18,7 +18,6 @@ from typing import Dict, List, Optional, Tuple
 # - TCP sockets + Python threads for concurrent clients.
 # - SQLite as the centralized shared data store.
 # - One simple lock around database operations to keep concurrent access
-#   safe and easy to understand.
 # - JSON messages with a fixed-length header so large uploads do not break.
 # ============================================================
 
