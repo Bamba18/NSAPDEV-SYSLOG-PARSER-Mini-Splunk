@@ -7,9 +7,9 @@ import sqlite3
 import threading
 from typing import Dict, List, Optional, Tuple
 
-# ============================================================
+# -------------------------------------------------------------
 # Mini-Splunk Syslog Server
-# ============================================================
+# -------------------------------------------------------------
 # This server accepts TCP client connections, receives syslog files,
 # parses them, stores them in SQLite, and answers search/count/purge
 # requests.
@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 # - SQLite as the centralized shared data store.
 # - One simple lock around database operations to keep concurrent access
 # - JSON messages with a fixed-length header so large uploads do not break.
-# ============================================================
+# -------------------------------------------------------------
 
 HOST = "0.0.0.0"
 PORT = 65432
@@ -30,11 +30,11 @@ HEADER_SIZE = 16          # length prefix size for JSON messages
 INSERT_BATCH_SIZE = 5000  # write rows to SQLite in chunks
 DEFAULT_PAGE_SIZE = 20    # default number of search results shown per page
 MAX_PAGE_SIZE = 100       # cap so one query does not request an extreme page size
-ACCEPT_TIMEOUT = 1.0      # helps Ctrl+C stop the server cleanly
+ACCEPT_TIMEOUT = 1.0      # for Ctrl+C stop the server cleanly
 
-# ============================================================
+# -------------------------------------------------------------
 # Regular expressions for supported syslog formats
-# ============================================================
+# -------------------------------------------------------------
 
 # RFC 5424 example:
 # <34>1 2024-02-22T10:00:00Z host app 1234 ID47 Message text
@@ -225,9 +225,9 @@ def parse_syslog_line(line: str) -> Optional[Tuple[str, str, str, str, str, str]
     return None
 
 
-# ============================================================
+# -------------------------------------------------------------
 # Socket helpers
-# ============================================================
+# -------------------------------------------------------------
 
 def recv_exact(sock: socket.socket, size: int) -> Optional[bytes]:
     """Receive exactly 'size' bytes from the socket, or None if closed."""
@@ -265,9 +265,9 @@ def send_json(sock: socket.socket, obj: Dict) -> None:
     sock.sendall(header + payload)
 
 
-# ============================================================
+# -------------------------------------------------------------
 # Query helpers
-# ============================================================
+# -------------------------------------------------------------
 
 def sanitize_page(page_value) -> int:
     try:
@@ -310,9 +310,9 @@ def count_and_preview(where_sql: str, params: Tuple, page: int, page_size: int) 
     return total_count, preview_lines, current_page, total_pages
 
 
-# ============================================================
+# -------------------------------------------------------------
 # Request handlers
-# ============================================================
+# -------------------------------------------------------------
 
 def handle_ingest(request: Dict) -> Dict:
     """
@@ -463,9 +463,9 @@ def process_request(request: Dict) -> Dict:
     return {"status": "ERROR", "message": f"Unknown action: {action}"}
 
 
-# ============================================================
+# -------------------------------------------------------------
 # Client handling and graceful shutdown
-# ============================================================
+# -------------------------------------------------------------
 
 def client_thread(conn: socket.socket, addr) -> None:
     try:
