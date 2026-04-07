@@ -5,9 +5,9 @@ import socket
 import sys
 from typing import Dict, Optional, Tuple
 
-# ============================================================
+# -------------------------------------------------------------
 # Mini-Splunk CLI Client
-# ============================================================
+# -------------------------------------------------------------
 # What this client does:
 # - Reads commands from the user.
 # - Connects to the server using TCP.
@@ -17,7 +17,7 @@ from typing import Dict, Optional, Tuple
 # Network reminder:
 # - Use 127.0.0.1:65432 when client and server are on the same machine.
 # - Use the server machine's real IP address when they are on different machines.
-# ============================================================
+# -------------------------------------------------------------
 
 HEADER_SIZE = 16
 DEFAULT_HOSTPORT = "127.0.0.1:65432"
