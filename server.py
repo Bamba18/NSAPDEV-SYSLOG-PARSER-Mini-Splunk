@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import socket
@@ -6,35 +7,38 @@ import sqlite3
 import threading
 from typing import Dict, List, Optional, Tuple
 
-# ==============================
+# ============================================================
 # Mini-Splunk Syslog Server
-# ==============================
+# ============================================================
 # This server accepts TCP client connections, receives syslog files,
-# parses each line, stores parsed records in SQLite, and answers
-# search/count/purge commands.
+# parses them, stores them in SQLite, and answers search/count/purge
+# requests.
 #
-# Design choices:
-# - Native Python sockets + threads to satisfy the project requirement.
-# - SQLite as the centralized shared store.
-# - A single re-entrant lock keeps database operations safe and simple.
-# - Parsing happens OUTSIDE the lock so multiple clients can still upload
-#   and parse in parallel before writing their batches to the database.
-#
-# The code is intentionally kept straightforward and heavily commented
-# so it is easier to study.
+# Key design choices:
+# - TCP sockets + Python threads for concurrent clients.
+# - SQLite as the centralized shared data store.
+# - One simple lock around database operations to keep concurrent access
+#   safe and easy to understand.
+# - JSON messages with a fixed-length header so large uploads do not break.
+# ============================================================
 
 HOST = "0.0.0.0"
 PORT = 65432
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "syslog_index.db")
-INSERT_BATCH_SIZE = 5000     # insert rows in chunks to avoid memory spikes
-PREVIEW_LIMIT = 20           # how many matching rows to show to the client
-HEADER_SIZE = 16             # fixed-size length prefix for each JSON message
-ACCEPT_TIMEOUT = 1.0         # lets Ctrl+C break the accept loop cleanly
 
-# Regex for RFC 5424 syslog lines.
-# Example:
-# <34>1 2024-02-22T10:00:00Z host app 1234 ID47 message
+HEADER_SIZE = 16          # length prefix size for JSON messages
+INSERT_BATCH_SIZE = 5000  # write rows to SQLite in chunks
+DEFAULT_PAGE_SIZE = 20    # default number of search results shown per page
+MAX_PAGE_SIZE = 100       # cap so one query does not request an extreme page size
+ACCEPT_TIMEOUT = 1.0      # helps Ctrl+C stop the server cleanly
+
+# ============================================================
+# Regular expressions for supported syslog formats
+# ============================================================
+
+# RFC 5424 example:
+# <34>1 2024-02-22T10:00:00Z host app 1234 ID47 Message text
 RFC5424_RE = re.compile(
     r"^<(?P<pri>\d+)>(?P<version>\d)\s+"
     r"(?P<timestamp>\S+)\s+"
@@ -42,16 +46,11 @@ RFC5424_RE = re.compile(
     r"(?P<appname>\S+)\s+"
     r"(?P<procid>\S+)\s+"
     r"(?P<msgid>\S+)\s+"
-    r"(?P<rest>.*)$"
+    r"(?P<message>.*)$"
 )
 
-# Regex for classic RFC 3164-style syslog lines.
-# Example:
+# Classic syslog / RFC 3164-style example:
 # Feb 22 00:00:09 ccs-cuda sshd[133388]: Failed password for root ...
-#
-# Notes:
-# - Single-digit days in classic syslog may have 2 spaces, e.g. "Feb  7".
-# - The process part is captured lazily up to the first colon.
 RFC3164_RE = re.compile(
     r"^(?P<timestamp>[A-Z][a-z]{2}\s+\d{1,2}\s\d{2}:\d{2}:\d{2})\s+"
     r"(?P<hostname>\S+)\s+"
@@ -59,7 +58,6 @@ RFC3164_RE = re.compile(
     r"(?P<message>.*)$"
 )
 
-# Syslog severity number -> readable label.
 SEVERITY_MAP = {
     0: "EMERG",
     1: "ALERT",
@@ -71,6 +69,10 @@ SEVERITY_MAP = {
     7: "DEBUG",
 }
 
+shutdown_event = threading.Event()
+client_threads: List[threading.Thread] = []
+client_threads_lock = threading.Lock()
+
 
 def normalize_spaces(text: str) -> str:
     """Collapse repeated whitespace into a single space."""
@@ -79,29 +81,21 @@ def normalize_spaces(text: str) -> str:
 
 def infer_severity(message: str) -> str:
     """
-    Infer a severity when the log line does not contain an explicit
-    RFC 5424 severity value.
-
-    This is useful for classic auth/syslog lines like the uploaded samples.
+    Infer a readable severity for classic syslog lines that do not include
+    an explicit RFC 5424 priority field.
     """
     text = message.upper()
 
-    # Stronger / more critical keywords first.
     if "EMERG" in text:
         return "EMERG"
     if "ALERT" in text:
         return "ALERT"
     if "CRIT" in text or "CRITICAL" in text:
         return "CRIT"
-
-    # Treat failures and explicit errors as ERROR.
     if "ERROR" in text or "FAILED" in text or "FAILURE" in text:
         return "ERROR"
-
-    # Warnings and invalid attempts.
     if "WARN" in text or "WARNING" in text or "INVALID" in text:
         return "WARN"
-
     if "DEBUG" in text:
         return "DEBUG"
     if "NOTICE" in text:
@@ -118,11 +112,11 @@ class LogStore:
         self.lock = threading.RLock()
         self._init_db()
 
-    def _connect(self):
+    def _connect(self) -> sqlite3.Connection:
         """
         Open a fresh SQLite connection.
         check_same_thread=False is needed because multiple server threads
-        will access the database.
+        use the database.
         """
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
@@ -130,7 +124,7 @@ class LogStore:
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
-    def _init_db(self):
+    def _init_db(self) -> None:
         with self._connect() as conn:
             conn.execute(
                 """
@@ -145,8 +139,6 @@ class LogStore:
                 )
                 """
             )
-
-            # Helpful indexes so searches are faster on large files.
             conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_hostname ON logs(hostname)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_process ON logs(process)")
@@ -154,7 +146,6 @@ class LogStore:
             conn.commit()
 
     def insert_many(self, rows: List[Tuple[str, str, str, str, str, str]]) -> None:
-        """Insert a batch of parsed rows safely."""
         with self.lock:
             with self._connect() as conn:
                 conn.executemany(
@@ -167,14 +158,12 @@ class LogStore:
                 conn.commit()
 
     def query_many(self, sql: str, params: Tuple = ()) -> List[Dict]:
-        """Run a SELECT that returns many rows."""
         with self.lock:
             with self._connect() as conn:
                 cur = conn.execute(sql, params)
                 return [dict(row) for row in cur.fetchall()]
 
     def query_one(self, sql: str, params: Tuple = ()) -> Optional[Dict]:
-        """Run a SELECT that returns a single row."""
         with self.lock:
             with self._connect() as conn:
                 cur = conn.execute(sql, params)
@@ -182,10 +171,6 @@ class LogStore:
                 return dict(row) if row else None
 
     def purge(self) -> int:
-        """
-        Delete all indexed logs.
-        The same lock is used here so PURGE behaves like an exclusive write.
-        """
         with self.lock:
             with self._connect() as conn:
                 total = conn.execute("SELECT COUNT(*) AS total FROM logs").fetchone()[0]
@@ -197,12 +182,12 @@ class LogStore:
 store = LogStore(DB_PATH)
 
 
-def parse_syslog_line(line: str):
+def parse_syslog_line(line: str) -> Optional[Tuple[str, str, str, str, str, str]]:
     """
     Parse one syslog line.
 
-    Returns a tuple matching the database columns:
-    (timestamp, hostname, process, severity, message, raw_line)
+    Returns:
+        (timestamp, hostname, process, severity, message, raw_line)
 
     Returns None if the line cannot be parsed.
     """
@@ -210,26 +195,22 @@ def parse_syslog_line(line: str):
     if not line:
         return None
 
-    # Try RFC 5424 first.
     match = RFC5424_RE.match(line)
     if match:
         pri = int(match.group("pri"))
         severity = SEVERITY_MAP.get(pri % 8, "INFO")
-
         appname = match.group("appname")
         procid = match.group("procid")
         process = appname if procid == "-" else f"{appname}[{procid}]"
-
         return (
             normalize_spaces(match.group("timestamp")),
             match.group("hostname"),
             process,
             severity,
-            match.group("rest"),
+            match.group("message"),
             line,
         )
 
-    # Then try RFC 3164 / classic syslog.
     match = RFC3164_RE.match(line)
     if match:
         message = match.group("message")
@@ -245,8 +226,12 @@ def parse_syslog_line(line: str):
     return None
 
 
-def recv_exact(sock: socket.socket, size: int):
-    """Receive exactly size bytes from a socket, or None if it closes."""
+# ============================================================
+# Socket helpers
+# ============================================================
+
+def recv_exact(sock: socket.socket, size: int) -> Optional[bytes]:
+    """Receive exactly 'size' bytes from the socket, or None if closed."""
     data = b""
     while len(data) < size:
         chunk = sock.recv(size - len(data))
@@ -256,13 +241,8 @@ def recv_exact(sock: socket.socket, size: int):
     return data
 
 
-def recv_json(sock: socket.socket):
-    """
-    Read one length-prefixed JSON message.
-    Message format:
-    - first HEADER_SIZE bytes = payload length written as digits
-    - then the JSON payload bytes
-    """
+def recv_json(sock: socket.socket) -> Optional[Dict]:
+    """Receive one length-prefixed JSON message."""
     header = recv_exact(sock, HEADER_SIZE)
     if not header:
         return None
@@ -286,15 +266,64 @@ def send_json(sock: socket.socket, obj: Dict) -> None:
     sock.sendall(header + payload)
 
 
+# ============================================================
+# Query helpers
+# ============================================================
+
+def sanitize_page(page_value) -> int:
+    try:
+        page = int(page_value)
+    except (TypeError, ValueError):
+        page = 1
+    return max(1, page)
+
+
+def sanitize_page_size(page_size_value) -> int:
+    try:
+        page_size = int(page_size_value)
+    except (TypeError, ValueError):
+        page_size = DEFAULT_PAGE_SIZE
+    return max(1, min(MAX_PAGE_SIZE, page_size))
+
+
+def count_and_preview(where_sql: str, params: Tuple, page: int, page_size: int) -> Tuple[int, List[str], int, int]:
+    """
+    Return:
+        total_count, preview_lines, current_page, total_pages
+    """
+    count_row = store.query_one(f"SELECT COUNT(*) AS total FROM logs WHERE {where_sql}", params)
+    total_count = count_row["total"] if count_row else 0
+
+    total_pages = math.ceil(total_count / page_size) if total_count else 0
+
+    if total_pages == 0:
+        return 0, [], 1, 0
+
+    current_page = min(page, total_pages)
+    offset = (current_page - 1) * page_size
+
+    preview_rows = store.query_many(
+        f"SELECT raw_line FROM logs WHERE {where_sql} ORDER BY id LIMIT ? OFFSET ?",
+        params + (page_size, offset),
+    )
+    preview_lines = [row["raw_line"] for row in preview_rows]
+
+    return total_count, preview_lines, current_page, total_pages
+
+
+# ============================================================
+# Request handlers
+# ============================================================
+
 def handle_ingest(request: Dict) -> Dict:
     """
     Parse and index one uploaded syslog file.
 
-    Parsing is done before each database write batch so we do not hold the
-    database lock longer than needed.
+    Parsing is done outside the database lock. SQLite writes happen in
+    batches so very large files do not accumulate too much in memory.
     """
     text = request.get("content", "")
-    parsed_rows: List[Tuple[str, str, str, str, str, str]] = []
+    batch: List[Tuple[str, str, str, str, str, str]] = []
     parsed_count = 0
     invalid_count = 0
 
@@ -307,117 +336,90 @@ def handle_ingest(request: Dict) -> Dict:
             invalid_count += 1
             continue
 
-        parsed_rows.append(row)
+        batch.append(row)
         parsed_count += 1
 
-        if len(parsed_rows) >= INSERT_BATCH_SIZE:
-            store.insert_many(parsed_rows)
-            parsed_rows.clear()
+        if len(batch) >= INSERT_BATCH_SIZE:
+            store.insert_many(batch)
+            batch.clear()
 
-    if parsed_rows:
-        store.insert_many(parsed_rows)
+    if batch:
+        store.insert_many(batch)
 
     return {
         "status": "SUCCESS",
         "message": f"File received and {parsed_count:,} syslog entries parsed and indexed.",
         "parsed_count": parsed_count,
         "invalid_count": invalid_count,
-        "filename": request.get("filename", ""),
-    }
-
-
-def build_response_for_search(query_type: str, query_value: str, count_sql: str, preview_sql: str, params: Tuple) -> Dict:
-    """Run a count query plus a preview query, then build one consistent response."""
-    count_row = store.query_one(count_sql, params)
-    total_count = count_row["total"] if count_row else 0
-    preview_rows = store.query_many(preview_sql, params)
-
-    return {
-        "status": "SUCCESS",
-        "query_type": query_type,
-        "query_value": query_value,
-        "count": total_count,
-        "returned": len(preview_rows),
-        "results": [row["raw_line"] for row in preview_rows],
     }
 
 
 def handle_query(request: Dict) -> Dict:
-    """Handle all search/count query types from the client."""
-    query_type = request.get("query_type", "").upper()
+    """Handle all QUERY subcommands required by the project spec."""
+    query_type = request.get("query_type", "").upper().strip()
     value = request.get("value", "")
-
-    if query_type == "SEARCH_DATE":
-        normalized_value = normalize_spaces(value)
-        params = (f"{normalized_value}%",)
-        return build_response_for_search(
-            "SEARCH_DATE",
-            value,
-            "SELECT COUNT(*) AS total FROM logs WHERE timestamp LIKE ?",
-            f"SELECT raw_line FROM logs WHERE timestamp LIKE ? ORDER BY id LIMIT {PREVIEW_LIMIT}",
-            params,
-        )
-
-    if query_type == "SEARCH_HOST":
-        params = (value,)
-        return build_response_for_search(
-            "SEARCH_HOST",
-            value,
-            "SELECT COUNT(*) AS total FROM logs WHERE LOWER(hostname) = LOWER(?)",
-            f"SELECT raw_line FROM logs WHERE LOWER(hostname) = LOWER(?) ORDER BY id LIMIT {PREVIEW_LIMIT}",
-            params,
-        )
-
-    if query_type == "SEARCH_DAEMON":
-        params = (f"{value}%",)
-        return build_response_for_search(
-            "SEARCH_DAEMON",
-            value,
-            "SELECT COUNT(*) AS total FROM logs WHERE LOWER(process) LIKE LOWER(?)",
-            f"SELECT raw_line FROM logs WHERE LOWER(process) LIKE LOWER(?) ORDER BY id LIMIT {PREVIEW_LIMIT}",
-            params,
-        )
-
-    if query_type == "SEARCH_SEVERITY":
-        params = (value,)
-        return build_response_for_search(
-            "SEARCH_SEVERITY",
-            value,
-            "SELECT COUNT(*) AS total FROM logs WHERE UPPER(severity) = UPPER(?)",
-            f"SELECT raw_line FROM logs WHERE UPPER(severity) = UPPER(?) ORDER BY id LIMIT {PREVIEW_LIMIT}",
-            params,
-        )
-
-    if query_type == "SEARCH_KEYWORD":
-        params = (f"%{value}%",)
-        return build_response_for_search(
-            "SEARCH_KEYWORD",
-            value,
-            "SELECT COUNT(*) AS total FROM logs WHERE message LIKE ?",
-            f"SELECT raw_line FROM logs WHERE message LIKE ? ORDER BY id LIMIT {PREVIEW_LIMIT}",
-            params,
-        )
+    page = sanitize_page(request.get("page", 1))
+    page_size = sanitize_page_size(request.get("page_size", DEFAULT_PAGE_SIZE))
 
     if query_type == "COUNT_KEYWORD":
-        row = store.query_one("SELECT COUNT(*) AS total FROM logs WHERE message LIKE ?", (f"%{value}%",))
-        total_count = row["total"] if row else 0
+        row = store.query_one(
+            "SELECT COUNT(*) AS total FROM logs WHERE LOWER(message) LIKE LOWER(?)",
+            (f"%{value}%",),
+        )
         return {
             "status": "SUCCESS",
-            "query_type": "COUNT_KEYWORD",
+            "query_type": query_type,
             "query_value": value,
-            "count": total_count,
-            "returned": 0,
+            "count": row["total"] if row else 0,
             "results": [],
         }
 
+    if query_type == "SEARCH_DATE":
+        where_sql = "timestamp LIKE ?"
+        params = (f"{normalize_spaces(value)}%",)
+    elif query_type == "SEARCH_HOST":
+        where_sql = "UPPER(hostname) = UPPER(?)"
+        params = (value,)
+    elif query_type == "SEARCH_DAEMON":
+        # Prefix search lets "sshd" match "sshd[1234]".
+        where_sql = "LOWER(process) LIKE LOWER(?)"
+        params = (f"{value}%",)
+    elif query_type == "SEARCH_SEVERITY":
+        where_sql = "UPPER(severity) = UPPER(?)"
+        params = (value,)
+    elif query_type == "SEARCH_KEYWORD":
+        where_sql = "LOWER(message) LIKE LOWER(?)"
+        params = (f"%{value}%",)
+    else:
+        return {"status": "ERROR", "message": f"Unknown query type: {query_type}"}
+
+    total_count, preview_lines, current_page, total_pages = count_and_preview(
+        where_sql,
+        params,
+        page,
+        page_size,
+    )
+
+    returned = len(preview_lines)
+    start_index = ((current_page - 1) * page_size) + 1 if returned else 0
+    end_index = start_index + returned - 1 if returned else 0
+
     return {
-        "status": "ERROR",
-        "message": f"Unknown query type: {query_type}",
+        "status": "SUCCESS",
+        "query_type": query_type,
+        "query_value": value,
+        "count": total_count,
+        "returned": returned,
+        "page": current_page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "start_index": start_index,
+        "end_index": end_index,
+        "results": preview_lines,
     }
 
 
-def handle_purge(_: Dict) -> Dict:
-    """Erase all currently indexed logs."""
+def handle_purge(_request: Dict) -> Dict:
     total = store.purge()
     return {
         "status": "SUCCESS",
@@ -426,121 +428,103 @@ def handle_purge(_: Dict) -> Dict:
     }
 
 
-def handle_stats(_: Dict) -> Dict:
-    """Return simple top-level statistics about the indexed logs."""
-    total_logs = store.query_one("SELECT COUNT(*) AS total FROM logs")["total"]
-    top_hosts = store.query_many(
+def handle_stats(_request: Dict) -> Dict:
+    total = store.query_one("SELECT COUNT(*) AS total FROM logs")["total"]
+    by_host = store.query_many(
         "SELECT hostname, COUNT(*) AS count FROM logs GROUP BY hostname ORDER BY count DESC LIMIT 10"
     )
-    top_processes = store.query_many(
+    by_process = store.query_many(
         "SELECT process, COUNT(*) AS count FROM logs GROUP BY process ORDER BY count DESC LIMIT 10"
     )
-    top_severity = store.query_many(
+    by_severity = store.query_many(
         "SELECT severity, COUNT(*) AS count FROM logs GROUP BY severity ORDER BY count DESC LIMIT 10"
     )
 
     return {
         "status": "SUCCESS",
-        "total_logs": total_logs,
-        "top_hosts": top_hosts,
-        "top_processes": top_processes,
-        "top_severity": top_severity,
+        "total_logs": total,
+        "top_hosts": by_host,
+        "top_processes": by_process,
+        "top_severity": by_severity,
     }
 
 
-def client_thread(conn: socket.socket, addr: Tuple[str, int]) -> None:
-    """
-    Handle exactly one client request on one thread.
+def process_request(request: Dict) -> Dict:
+    action = request.get("action", "").upper().strip()
 
-    Flow:
-    - receive request
-    - check action
-    - run matching handler
-    - send response
-    - close connection
-    """
+    if action == "INGEST":
+        return handle_ingest(request)
+    if action == "QUERY":
+        return handle_query(request)
+    if action == "PURGE":
+        return handle_purge(request)
+    if action == "STATS":
+        return handle_stats(request)
+
+    return {"status": "ERROR", "message": f"Unknown action: {action}"}
+
+
+# ============================================================
+# Client handling and graceful shutdown
+# ============================================================
+
+def client_thread(conn: socket.socket, addr) -> None:
     try:
         request = recv_json(conn)
         if request is None:
             return
 
-        action = request.get("action", "").upper()
-
-        if action == "INGEST":
-            response = handle_ingest(request)
-        elif action == "QUERY":
-            response = handle_query(request)
-        elif action == "PURGE":
-            response = handle_purge(request)
-        elif action == "STATS":
-            response = handle_stats(request)
-        else:
-            response = {
-                "status": "ERROR",
-                "message": f"Unknown action: {action}",
-            }
-
+        response = process_request(request)
         send_json(conn, response)
-
     except Exception as exc:
         try:
             send_json(conn, {"status": "ERROR", "message": str(exc)})
         except Exception:
             pass
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def main() -> None:
-    """
-    Start the TCP server and keep accepting clients until Ctrl+C is pressed.
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.settimeout(ACCEPT_TIMEOUT)
 
-    Graceful Ctrl+C behavior:
-    - stop accepting new clients
-    - close the listening socket cleanly
-    - let already-finished requests exit normally
-    - print a clear shutdown message instead of a scary traceback
-    """
-    worker_threads: List[threading.Thread] = []
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_sock:
-        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_sock.bind((HOST, PORT))
-        server_sock.listen()
-        server_sock.settimeout(ACCEPT_TIMEOUT)
-
+    try:
+        server_socket.bind((HOST, PORT))
+        server_socket.listen()
         print(f"Server listening on {HOST}:{PORT}")
-        print(f"Database file: {DB_PATH}")
-        print("Press Ctrl+C to stop the server gracefully.")
 
-        try:
-            while True:
-                try:
-                    conn, addr = server_sock.accept()
-                except socket.timeout:
-                    continue
-                except OSError:
-                    # Happens if the listening socket closes during shutdown.
-                    break
-
-                thread = threading.Thread(target=client_thread, args=(conn, addr), daemon=True)
-                thread.start()
-                worker_threads.append(thread)
-
-        except KeyboardInterrupt:
-            print("\n[System Message] Ctrl+C received. Shutting down server gracefully...")
-
-        finally:
+        while not shutdown_event.is_set():
             try:
-                server_sock.close()
-            except OSError:
-                pass
+                conn, addr = server_socket.accept()
+            except socket.timeout:
+                continue
 
-            # Give worker threads a short chance to finish any in-progress request.
-            for thread in worker_threads:
-                thread.join(timeout=0.2)
+            thread = threading.Thread(target=client_thread, args=(conn, addr), daemon=True)
+            with client_threads_lock:
+                client_threads.append(thread)
+            thread.start()
 
-            print("[System Message] Server stopped.")
+    except KeyboardInterrupt:
+        print("\n[System Message] Ctrl+C received. Shutting down server gracefully...")
+        shutdown_event.set()
+    finally:
+        try:
+            server_socket.close()
+        except Exception:
+            pass
+
+        # Give worker threads a short chance to finish cleanly.
+        with client_threads_lock:
+            threads_snapshot = list(client_threads)
+        for thread in threads_snapshot:
+            thread.join(timeout=1.0)
+
+        print("[System Message] Server stopped.")
 
 
 if __name__ == "__main__":
