@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 # -------------------------------------------------------------
 
 HOST = "0.0.0.0"
-PORT = 65432
+PORT = 8080
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "syslog_index.db")
 
