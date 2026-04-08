@@ -20,7 +20,7 @@ from typing import Dict, Optional, Tuple
 # -------------------------------------------------------------
 
 HEADER_SIZE = 16
-DEFAULT_HOSTPORT = "127.0.0.1:65432"
+DEFAULT_HOSTPORT = "103.231.240.136:11130"
 DEFAULT_PAGE_SIZE = 20
 
 LAST_QUERY: Optional[Dict] = None
